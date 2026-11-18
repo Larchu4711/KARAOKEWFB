@@ -23,11 +23,14 @@ import {
   broadcastNightLeaderboard,
   cancelApplauseMeasurement,
   completeApplauseMeasurement,
+  deleteApplauseMeasurement,
   evaluateRoundAndLeaderboard,
   fetchNightLeaderboard,
   getCurrentApplauseState,
+  listApplauseMeasurements,
   pushApplauseLevel,
   refreshActiveApplauseLikes,
+  setApplauseMeasurementIncluded,
   startApplauseMeasurement,
 } from "./applause-service.ts";
 import {
@@ -36,7 +39,7 @@ import {
   suggestSongsServer,
 } from "./integrations.ts";
 import { playOrder } from "../src/lib/queue.ts";
-import { performancePoints } from "../src/lib/singer.ts";
+import { summedPerformancePoints } from "../src/lib/singer.ts";
 import { defaultStageControl } from "../src/lib/stage-control.ts";
 
 const uuidSchema = z.string().uuid();
@@ -78,10 +81,26 @@ export function createApiRouter(db: DbClient) {
            SELECT request_id, count(*)::int AS likes_count
            FROM public.performance_likes
            GROUP BY request_id
+         ),
+         meas_by_req AS (
+           SELECT request_id,
+             coalesce(sum(score) FILTER (WHERE included = true), 0)::int AS applause_total,
+             count(*) FILTER (WHERE included = true)::int AS applause_count,
+             count(*)::int AS all_meas_count
+           FROM public.applause_measurements
+           WHERE request_id IS NOT NULL AND status = 'completed' AND score IS NOT NULL
+           GROUP BY request_id
          )
-         SELECT s.*, coalesce(l.likes_count, 0)::int AS likes_count
+         SELECT s.*,
+           coalesce(l.likes_count, 0)::int AS likes_count,
+           CASE
+             WHEN coalesce(m.all_meas_count, 0) > 0 THEN m.applause_total
+             ELSE s.applause_score
+           END AS applause_total,
+           coalesce(m.applause_count, CASE WHEN s.applause_score IS NOT NULL THEN 1 ELSE 0 END)::int AS applause_count
          FROM public.song_requests s
          LEFT JOIN likes_by_req l ON l.request_id = s.id
+         LEFT JOIN meas_by_req m ON m.request_id = s.id
          WHERE s.created_at >= $1
          ORDER BY s.created_at ASC
          LIMIT 500`,
@@ -472,11 +491,19 @@ export function createApiRouter(db: DbClient) {
           song_title: string;
           status: string;
           applause_score: number | null;
+          applause_total: number | null;
+          applause_count: string | number;
           likes_count: string | number;
           created_at: string;
         }>(
           `SELECT s.id, s.song_title, s.status, s.applause_score, s.created_at,
-             (SELECT count(*)::int FROM public.performance_likes l WHERE l.request_id = s.id) AS likes_count
+             (SELECT count(*)::int FROM public.performance_likes l WHERE l.request_id = s.id) AS likes_count,
+             coalesce(
+               (SELECT sum(m.score)::int FROM public.applause_measurements m WHERE m.request_id = s.id AND m.status = 'completed' AND m.score IS NOT NULL AND m.included = true),
+               CASE WHEN NOT EXISTS (SELECT 1 FROM public.applause_measurements m WHERE m.request_id = s.id AND m.status = 'completed' AND m.score IS NOT NULL)
+                 THEN s.applause_score ELSE NULL END
+             ) AS applause_total,
+             (SELECT count(*)::int FROM public.applause_measurements m WHERE m.request_id = s.id AND m.status = 'completed' AND m.score IS NOT NULL AND m.included = true) AS applause_count
            FROM public.song_requests s
            WHERE s.user_id = $1
            ORDER BY s.created_at DESC
@@ -496,11 +523,16 @@ export function createApiRouter(db: DbClient) {
           requests: Number(statsRow?.requests ?? 0),
         },
         favorites: favRes.rows,
-        history: histRes.rows.map((h) => ({
-          ...h,
-          likes_count: Number(h.likes_count ?? 0),
-          total_points: performancePoints(h.applause_score, Number(h.likes_count ?? 0)),
-        })),
+        history: histRes.rows.map((h) => {
+          const likes = Number(h.likes_count ?? 0);
+          const applauseVal = h.applause_total ?? h.applause_score;
+          return {
+            ...h,
+            applause_count: Number(h.applause_count ?? 0),
+            likes_count: likes,
+            total_points: summedPerformancePoints(applauseVal, likes),
+          };
+        }),
       });
     } catch (err) {
       next(err);
@@ -785,14 +817,57 @@ export function createApiRouter(db: DbClient) {
     }
   });
 
+  router.get("/applause/measurements", requireDj, async (_req, res, next) => {
+    try {
+      const rows = await listApplauseMeasurements(db, 80);
+      res.json({ rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.patch("/applause/measurements/:id", requireDj, async (req, res, next) => {
+    try {
+      const id = uuidSchema.parse(req.params["id"]);
+      const body = z.object({ included: z.boolean() }).parse(req.body);
+      const result = await setApplauseMeasurementIncluded(db, id, body.included);
+      if (!result.ok) {
+        res.status(404).json({ ok: false, reason: "not_found" });
+        return;
+      }
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  router.delete("/applause/measurements/:id", requireDj, async (req, res, next) => {
+    try {
+      const id = uuidSchema.parse(req.params["id"]);
+      const result = await deleteApplauseMeasurement(db, id);
+      if (!result.ok) {
+        res.status(404).json({ ok: false, reason: "not_found" });
+        return;
+      }
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.post("/applause/start", requireDj, async (req, res, next) => {
     try {
       const body = z
         .object({
-          requestId: z.string().uuid(),
+          requestId: z.string().uuid().nullable().optional(),
+          singerName: z.string().trim().min(1).max(60).optional(),
+          singerUserId: z.string().uuid().nullable().optional(),
           measurementId: z.string().uuid(),
           durationMs: z.number().int().min(1000).max(30000).optional(),
           countdownMs: z.number().int().min(0).max(15000).optional(),
+        })
+        .refine((b) => Boolean(b.requestId || b.singerName), {
+          message: "Either requestId or singerName is required",
         })
         .parse(req.body);
       const result = await startApplauseMeasurement(db, body);
@@ -811,7 +886,7 @@ export function createApiRouter(db: DbClient) {
       const body = z
         .object({
           measurementId: z.string().uuid(),
-          requestId: z.string().uuid(),
+          requestId: z.string().uuid().nullable().optional(),
         })
         .parse(req.body);
       const result = await beginApplauseMeasurement(db, body);
@@ -830,7 +905,7 @@ export function createApiRouter(db: DbClient) {
       const body = z
         .object({
           measurementId: z.string().uuid(),
-          requestId: z.string().uuid(),
+          requestId: z.string().uuid().nullable().optional(),
           seq: z.number().int().min(1),
           level: z.number().min(0).max(1),
           peak: z.number().min(0).max(1),
@@ -849,7 +924,7 @@ export function createApiRouter(db: DbClient) {
       const body = z
         .object({
           measurementId: z.string().uuid(),
-          requestId: z.string().uuid(),
+          requestId: z.string().uuid().nullable().optional(),
           samples: z.array(z.number().min(0).max(1)).min(1).max(2000),
         })
         .parse(req.body);
@@ -869,7 +944,7 @@ export function createApiRouter(db: DbClient) {
       const body = z
         .object({
           measurementId: z.string().uuid(),
-          requestId: z.string().uuid(),
+          requestId: z.string().uuid().nullable().optional(),
           reason: z.enum(["cancelled", "failed"]).optional(),
         })
         .parse(req.body);

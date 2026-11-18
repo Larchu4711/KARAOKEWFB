@@ -5,6 +5,7 @@ import {
   getSingerKey,
   performancePoints,
   sortLeaderboard,
+  summedPerformancePoints,
   type LeaderboardEntry,
 } from "./singer";
 
@@ -18,9 +19,12 @@ describe("scoring and leaderboard helpers", () => {
     expect(performancePoints(undefined, 0)).toBe(0);
   });
 
-  it("clamps applause score cleanly to 0..100", () => {
+  it("clamps single-round applause score cleanly to 0..100 and sums multi-measurement totals without 100 cap", () => {
     expect(performancePoints(-15, 2)).toBe(20);
     expect(performancePoints(150, 2)).toBe(120);
+    expect(summedPerformancePoints(180, 3)).toBe(210);
+    expect(summedPerformancePoints(null, 2)).toBe(20);
+    expect(summedPerformancePoints(-10, 1)).toBe(10);
   });
 
   it("applies deterministic tie-breakers cleanly including guest entries", () => {

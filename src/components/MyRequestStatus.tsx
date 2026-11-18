@@ -1,7 +1,7 @@
 import { Clock, Mic } from "lucide-react";
 import { useI18n } from "@/lib/i18n";
 import { waitInfo, type SongRequest } from "@/lib/queue";
-import { performancePoints } from "@/lib/singer";
+import { summedPerformancePoints } from "@/lib/singer";
 import { Button } from "@/components/ui/button";
 
 export function MyRequestStatus({
@@ -29,8 +29,10 @@ export function MyRequestStatus({
             : t.statusWaiting;
   const hot = me.status === "playing" || me.status === "next";
   const likes = me.likes_count ?? 0;
-  const hasApplause = typeof me.applause_score === "number";
-  const totalPoints = performancePoints(me.applause_score, likes);
+  const applauseDisplay = me.applause_total ?? me.applause_score;
+  const applauseCount = me.applause_count ?? (typeof me.applause_score === "number" ? 1 : 0);
+  const hasApplause = typeof applauseDisplay === "number" && applauseCount > 0;
+  const totalPoints = summedPerformancePoints(applauseDisplay, likes);
 
   return (
     <div
@@ -73,7 +75,11 @@ export function MyRequestStatus({
           <span>
             {t.applauseScoreLabel}:{" "}
             <strong className="text-foreground tabular-nums">
-              {hasApplause ? `${me.applause_score}/100` : t.applauseNotMeasured}
+              {hasApplause
+                ? applauseCount > 1
+                  ? `${applauseDisplay} (${applauseCount}×)`
+                  : `${applauseDisplay}/100`
+                : t.applauseNotMeasured}
             </strong>
           </span>
           <span>

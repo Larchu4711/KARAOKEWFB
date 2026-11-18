@@ -122,11 +122,12 @@ export const applauseMeasurements = pgTable(
   "applause_measurements",
   {
     id: uuid("id").primaryKey(),
-    requestId: uuid("request_id")
-      .notNull()
-      .references(() => songRequests.id, { onDelete: "cascade" }),
+    requestId: uuid("request_id").references(() => songRequests.id, { onDelete: "cascade" }),
+    singerUserId: uuid("singer_user_id"),
+    singerName: text("singer_name"),
     status: text("status").notNull(),
     startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+    countdownEndsAt: timestamp("countdown_ends_at", { withTimezone: true }),
     endsAt: timestamp("ends_at", { withTimezone: true }).notNull(),
     durationMs: integer("duration_ms").notNull().default(10000),
     latestLevel: doublePrecision("latest_level").notNull().default(0),
@@ -134,11 +135,13 @@ export const applauseMeasurements = pgTable(
     lastSeq: integer("last_seq").notNull().default(0),
     score: integer("score"),
     samplesCount: integer("samples_count").notNull().default(0),
+    included: boolean("included").notNull().default(true),
     completedAt: timestamp("completed_at", { withTimezone: true }),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     index("applause_measurements_request_idx").on(t.requestId, t.startedAt),
+    index("applause_measurements_singer_user_idx").on(t.singerUserId, t.completedAt),
     check(
       "applause_measurements_score_range",
       sql`${t.score} IS NULL OR (${t.score} >= 0 AND ${t.score} <= 100)`,

@@ -36,10 +36,10 @@ export type ApplauseMeasurementStatus =
   | "failed";
 
 export interface RoundEvaluationSummary {
-  requestId: string;
+  requestId: string | null;
   singerId: string;
   singerName: string;
-  songTitle: string;
+  songTitle: string | null;
   isGuest: boolean;
   applauseScore: number;
   likes: number;
@@ -51,9 +51,22 @@ export interface RoundEvaluationSummary {
   evaluatedAt: number;
 }
 
+export interface ApplauseMeasurementItem {
+  id: string;
+  request_id: string | null;
+  singer_user_id: string | null;
+  singer_name: string;
+  song_title: string | null;
+  score: number;
+  included: boolean;
+  completed_at: string;
+  started_at: string;
+}
+
 export interface ApplauseStateSnapshot {
   measurementId: string | null;
   requestId: string | null;
+  singerUserId?: string | null;
   singerName: string | null;
   songTitle: string | null;
   status: ApplauseMeasurementStatus;
@@ -346,13 +359,13 @@ export function shouldAcceptApplauseUpdate(
   current: Pick<ApplauseStateSnapshot, "measurementId" | "requestId" | "lastSeq" | "updatedAt" | "status">,
   incoming: {
     measurementId: string;
-    requestId: string;
+    requestId?: string | null;
     status?: ApplauseMeasurementStatus;
     seq?: number;
     updatedAt?: number;
   },
 ): boolean {
-  if (!incoming.measurementId || !incoming.requestId) return false;
+  if (!incoming.measurementId) return false;
   if (current.measurementId && current.measurementId !== incoming.measurementId) {
     // Allow newer measurement only if its updatedAt is strictly newer than current
     if (
@@ -364,7 +377,9 @@ export function shouldAcceptApplauseUpdate(
     }
     return false;
   }
-  if (current.requestId && current.requestId !== incoming.requestId) return false;
+  const currReq = current.requestId ?? null;
+  const incReq = incoming.requestId ?? null;
+  if (current.measurementId === incoming.measurementId && currReq !== incReq) return false;
   if (typeof incoming.updatedAt === "number" && incoming.updatedAt < current.updatedAt) {
     return false;
   }
@@ -385,6 +400,7 @@ export function shouldAcceptApplauseUpdate(
 export const IDLE_APPLAUSE_STATE: ApplauseStateSnapshot = {
   measurementId: null,
   requestId: null,
+  singerUserId: null,
   singerName: null,
   songTitle: null,
   status: "idle",

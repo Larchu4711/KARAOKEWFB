@@ -156,5 +156,42 @@ describe("applause meter signal processing & state rules", () => {
         },
       ),
     ).toBe(true);
+
+    // Standalone candidate measurements (requestId: null) are accepted when consistent
+    expect(
+      shouldAcceptApplauseUpdate(
+        {
+          measurementId: "m2",
+          requestId: null,
+          lastSeq: 1,
+          updatedAt: 1000,
+          status: "measuring",
+        },
+        {
+          measurementId: "m2",
+          requestId: null,
+          seq: 2,
+          updatedAt: 1100,
+        },
+      ),
+    ).toBe(true);
+
+    expect(
+      shouldAcceptApplauseUpdate(
+        {
+          measurementId: "m2",
+          requestId: null,
+          lastSeq: 1,
+          updatedAt: 1000,
+          status: "measuring",
+        },
+        {
+          measurementId: "m2",
+          requestId: "r1",
+          seq: 2,
+          updatedAt: 1100,
+        },
+      ),
+    ).toBe(false);
   });
 });

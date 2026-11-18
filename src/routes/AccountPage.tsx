@@ -23,6 +23,8 @@ type Hist = {
   song_title: string;
   status: string;
   applause_score: number | null;
+  applause_total?: number | null;
+  applause_count?: number;
   likes_count: number;
   total_points: number;
   created_at: string;
@@ -252,8 +254,10 @@ function Card({ onSignOut }: { onSignOut: () => void }) {
               >
                 <span className="min-w-0 flex-1 truncate">{h.song_title}</span>
                 <span className="text-xs text-muted-foreground tabular-nums">
-                  {typeof h.applause_score === "number"
-                    ? `${t.applausePointsShort}: ${h.applause_score}/100`
+                  {typeof (h.applause_total ?? h.applause_score) === "number"
+                    ? (h.applause_count ?? 1) > 1
+                      ? `${t.applausePointsShort}: ${h.applause_total} (${h.applause_count}×)`
+                      : `${t.applausePointsShort}: ${h.applause_total ?? h.applause_score}/100`
                     : t.applauseNotMeasured}{" "}
                   · ♥ {h.likes_count} · <strong className="text-primary">{h.total_points} {t.points}</strong>
                 </span>

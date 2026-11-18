@@ -67,6 +67,7 @@ describe("Server, Database & Applausometer integration", () => {
       "0004_applause_countdown.sql",
       "0005_guest_leaderboard.sql",
       "0006_stage_language.sql",
+      "0007_multi_applause_and_guest_ranking.sql",
     ]);
 
     const app = createExpressApp(db);
@@ -517,10 +518,195 @@ describe("Server, Database & Applausometer integration", () => {
       ["Sara", true, 1],
     ]);
 
-    // Monthly & All-time remain scoped to registered accounts only
+    // Monthly & All-time leaderboards ALSO persist unregistered guest singers alongside registered accounts
     const monthLb = await api(baseUrl, null, "/api/leaderboard?period=month");
     const monthRows = monthLb.json["rows"] as Array<Record<string, unknown>>;
-    expect(monthRows.map((r) => r["display_name"])).toEqual(["Ana"]);
+    expect(monthRows.map((r) => [r["display_name"], r["is_guest"]])).toEqual([
+      ["lukas", true],
+      ["Ana", false],
+      ["Sara", true],
+    ]);
+
+    const allLb = await api(baseUrl, null, "/api/leaderboard?period=all");
+    const allRows = allLb.json["rows"] as Array<Record<string, unknown>>;
+    expect(allRows.map((r) => [r["display_name"], r["is_guest"]])).toEqual([
+      ["lukas", true],
+      ["Ana", false],
+      ["Sara", true],
+    ]);
+  });
+
+  it("supports multiple applause measurements per candidate (including waiting/no song) and toggling inclusion in total score", async () => {
+    const dj = new CookieJar();
+    await api(baseUrl, dj, "/api/dj/login", {
+      method: "POST",
+      body: JSON.stringify({ password: "test-dj-pw" }),
+    });
+
+    // 1) Registered singer Mina has a WAITING song (has not sung yet) -> DJ measures twice!
+    const mina = new CookieJar();
+    const minaLogin = await api(baseUrl, mina, "/api/auth/local-login", {
+      method: "POST",
+      body: JSON.stringify({ email: "mina@example.com", displayName: "Mina" }),
+    });
+    const minaId = String((minaLogin.json["user"] as Record<string, unknown>)["id"]);
+
+    const minaReq = await api(baseUrl, mina, "/api/requests", {
+      method: "POST",
+      body: JSON.stringify({
+        singer_name: "Mina",
+        song_title: "Waiting Hit",
+        video_id: "55555555555",
+      }),
+    });
+    const minaReqId = String(minaReq.json["id"]);
+
+    // First measurement while waiting (samples = 0.65 -> 70 pts)
+    const mWait1 = "99999999-9999-4999-8999-999999999201";
+    const sWait1 = await api(baseUrl, dj, "/api/applause/start", {
+      method: "POST",
+      body: JSON.stringify({ requestId: minaReqId, measurementId: mWait1, countdownMs: 0 }),
+    });
+    expect(sWait1.status).toBe(200);
+    const cWait1 = await api(baseUrl, dj, "/api/applause/complete", {
+      method: "POST",
+      body: JSON.stringify({ measurementId: mWait1, requestId: minaReqId, samples: Array(25).fill(0.65) }),
+    });
+    expect(cWait1.status).toBe(200);
+    expect((cWait1.json["state"] as Record<string, unknown>)["score"]).toBe(70);
+
+    // Second measurement on the SAME waiting song (samples = 0.42 -> ~50 pts)
+    const mWait2 = "99999999-9999-4999-8999-999999999202";
+    await api(baseUrl, dj, "/api/applause/start", {
+      method: "POST",
+      body: JSON.stringify({ requestId: minaReqId, measurementId: mWait2, countdownMs: 0 }),
+    });
+    const cWait2 = await api(baseUrl, dj, "/api/applause/complete", {
+      method: "POST",
+      body: JSON.stringify({ measurementId: mWait2, requestId: minaReqId, samples: Array(25).fill(0.42) }),
+    });
+    expect(cWait2.status).toBe(200);
+    const secondScore = Number((cWait2.json["state"] as Record<string, unknown>)["score"]);
+    expect(secondScore).toBeGreaterThan(40);
+
+    // Standalone measurement for Mina without any song (requestId: null)
+    const mStandaloneMina = "99999999-9999-4999-8999-999999999203";
+    const sStandalone = await api(baseUrl, dj, "/api/applause/start", {
+      method: "POST",
+      body: JSON.stringify({
+        requestId: null,
+        singerName: "Mina",
+        singerUserId: minaId,
+        measurementId: mStandaloneMina,
+        countdownMs: 0,
+      }),
+    });
+    expect(sStandalone.status).toBe(200);
+    const cStandalone = await api(baseUrl, dj, "/api/applause/complete", {
+      method: "POST",
+      body: JSON.stringify({ measurementId: mStandaloneMina, requestId: null, samples: Array(25).fill(0.65) }),
+    });
+    expect(cStandalone.status).toBe(200);
+
+    // 2) Unregistered candidate "Max" who NEVER sang any song gets measured twice!
+    const mMax1 = "99999999-9999-4999-8999-999999999204";
+    await api(baseUrl, dj, "/api/applause/start", {
+      method: "POST",
+      body: JSON.stringify({
+        requestId: null,
+        singerName: "Max",
+        measurementId: mMax1,
+        countdownMs: 0,
+      }),
+    });
+    await api(baseUrl, dj, "/api/applause/complete", {
+      method: "POST",
+      body: JSON.stringify({ measurementId: mMax1, requestId: null, samples: Array(25).fill(0.65) }),
+    });
+
+    const mMax2 = "99999999-9999-4999-8999-999999999205";
+    await api(baseUrl, dj, "/api/applause/start", {
+      method: "POST",
+      body: JSON.stringify({
+        requestId: null,
+        singerName: "Max",
+        measurementId: mMax2,
+        countdownMs: 0,
+      }),
+    });
+    await api(baseUrl, dj, "/api/applause/complete", {
+      method: "POST",
+      body: JSON.stringify({ measurementId: mMax2, requestId: null, samples: Array(25).fill(0.65) }),
+    });
+
+    // Queue returns summed applause_total & applause_count on Mina's waiting song
+    const queueRes = await api(baseUrl, null, "/api/queue");
+    const qRow = (queueRes.json["rows"] as Array<Record<string, unknown>>).find(
+      (r) => r["id"] === minaReqId,
+    );
+    expect(qRow?.["applause_count"]).toBe(2);
+    expect(qRow?.["applause_total"]).toBe(70 + secondScore);
+
+    // Leaderboard sums ALL measurements across all periods (even before Mina sings!)
+    const nightLb = await api(baseUrl, null, "/api/leaderboard?period=night");
+    const nightRows = nightLb.json["rows"] as Array<Record<string, unknown>>;
+    expect(
+      nightRows.map((r) => [r["display_name"], r["is_guest"], r["applause_points"], r["total_points"]]),
+    ).toEqual([
+      ["Mina", false, 70 + secondScore + 70, 70 + secondScore + 70],
+      ["Max", true, 140, 140],
+    ]);
+
+    const allLb = await api(baseUrl, null, "/api/leaderboard?period=all");
+    expect((allLb.json["rows"] as Array<Record<string, unknown>>).map((r) => r["display_name"])).toEqual([
+      "Mina",
+      "Max",
+    ]);
+
+    // /api/account reflects all 3 measurements for Mina
+    const minaAccount = await api(baseUrl, mina, "/api/account");
+    expect((minaAccount.json["stats"] as Record<string, unknown>)["applause_points"]).toBe(
+      70 + secondScore + 70,
+    );
+
+    // List measurements & toggle mWait2 excluded -> Mina's score drops by secondScore
+    const listRes = await api(baseUrl, dj, "/api/applause/measurements");
+    expect((listRes.json["rows"] as unknown[]).length).toBe(5);
+
+    const toggleOff = await api(baseUrl, dj, `/api/applause/measurements/${mWait2}`, {
+      method: "PATCH",
+      body: JSON.stringify({ included: false }),
+    });
+    expect(toggleOff.status).toBe(200);
+
+    const nightAfterExclude = await api(baseUrl, null, "/api/leaderboard?period=night");
+    const minaAfterExclude = (nightAfterExclude.json["rows"] as Array<Record<string, unknown>>).find(
+      (r) => r["display_name"] === "Mina",
+    );
+    expect(minaAfterExclude?.["total_points"]).toBe(140);
+
+    // Toggle mWait2 back on -> score restored
+    await api(baseUrl, dj, `/api/applause/measurements/${mWait2}`, {
+      method: "PATCH",
+      body: JSON.stringify({ included: true }),
+    });
+    const nightAfterRestore = await api(baseUrl, null, "/api/leaderboard?period=night");
+    const minaAfterRestore = (nightAfterRestore.json["rows"] as Array<Record<string, unknown>>).find(
+      (r) => r["display_name"] === "Mina",
+    );
+    expect(minaAfterRestore?.["total_points"]).toBe(70 + secondScore + 70);
+
+    // Delete mMax2 -> Max drops from 140 to 70
+    const delMax2 = await api(baseUrl, dj, `/api/applause/measurements/${mMax2}`, {
+      method: "DELETE",
+    });
+    expect(delMax2.json["ok"]).toBe(true);
+
+    const nightAfterDel = await api(baseUrl, null, "/api/leaderboard?period=night");
+    const maxAfterDel = (nightAfterDel.json["rows"] as Array<Record<string, unknown>>).find(
+      (r) => r["display_name"] === "Max",
+    );
+    expect(maxAfterDel?.["total_points"]).toBe(70);
   });
 
   it("enforces DB score range constraint 0..100 and separates leaderboard periods accurately", async () => {
@@ -615,6 +801,7 @@ describe("Server, Database & Applausometer integration", () => {
       "0004_applause_countdown.sql",
       "0005_guest_leaderboard.sql",
       "0006_stage_language.sql",
+      "0007_multi_applause_and_guest_ranking.sql",
     ]);
 
     // Existing row survived untouched and new column exists

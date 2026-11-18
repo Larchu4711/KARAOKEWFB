@@ -12,6 +12,8 @@ export interface SongRequest {
   status: string;
   position: number;
   applause_score?: number | null;
+  applause_total?: number | null;
+  applause_count?: number;
   applause_measured_at?: string | null;
   applause_measurement_id?: string | null;
   likes_count?: number;

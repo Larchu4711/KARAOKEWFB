@@ -16,6 +16,21 @@ export function performancePoints(
   return applause + likes * LIKE_POINTS_MULTIPLIER;
 }
 
+/**
+ * Sums total points when multiple 0..100 applause measurements are aggregated for a candidate or request.
+ */
+export function summedPerformancePoints(
+  applauseTotal: number | null | undefined,
+  receivedLikes: number,
+): number {
+  const applause =
+    typeof applauseTotal === "number" && Number.isFinite(applauseTotal)
+      ? Math.max(0, Math.round(applauseTotal))
+      : 0;
+  const likes = Math.max(0, Math.floor(Number.isFinite(receivedLikes) ? receivedLikes : 0));
+  return applause + likes * LIKE_POINTS_MULTIPLIER;
+}
+
 export function singerPoints(receivedLikes: number, applauseScore: number | null = 0): number {
   return performancePoints(applauseScore, receivedLikes);
 }

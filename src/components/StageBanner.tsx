@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { apiJson } from "@/lib/api";
 import { useI18n } from "@/lib/i18n";
 import { useAuthUser } from "@/hooks/use-auth-user";
-import { performancePoints } from "@/lib/singer";
+import { summedPerformancePoints } from "@/lib/singer";
 import type { SongRequest } from "@/lib/queue";
 import { getDeviceId } from "@/lib/device";
 
@@ -50,8 +50,10 @@ export function StageBanner({ current }: { current: SongRequest | undefined }) {
 
   if (!current) return null;
   const own = !!user && current.user_id === user.id;
-  const hasApplause = typeof current.applause_score === "number";
-  const totalPoints = performancePoints(current.applause_score, count);
+  const applauseDisplay = current.applause_total ?? current.applause_score;
+  const applauseCount = current.applause_count ?? (typeof current.applause_score === "number" ? 1 : 0);
+  const hasApplause = typeof applauseDisplay === "number" && applauseCount > 0;
+  const totalPoints = summedPerformancePoints(applauseDisplay, count);
 
   const toggle = async (): Promise<void> => {
     if (!user) {
@@ -129,7 +131,11 @@ export function StageBanner({ current }: { current: SongRequest | undefined }) {
           <span className="tabular-nums">
             {t.applauseScoreLabel}:{" "}
             <strong className="text-foreground">
-              {hasApplause ? `${current.applause_score}/100` : t.applauseNotMeasured}
+              {hasApplause
+                ? applauseCount > 1
+                  ? `${applauseDisplay} (${applauseCount}×)`
+                  : `${applauseDisplay}/100`
+                : t.applauseNotMeasured}
             </strong>
           </span>
           <span aria-hidden="true">·</span>

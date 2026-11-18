@@ -32,8 +32,14 @@ export type RecorderErrorCode =
   | "insufficient"
   | null;
 
+export interface ApplauseTargetInput {
+  requestId?: string | null;
+  singerName?: string;
+  singerUserId?: string | null;
+}
+
 export interface CompletedMeasurement {
-  requestId: string;
+  requestId: string | null;
   measurementId: string;
   score: number;
   likes: number;
@@ -75,7 +81,7 @@ export function useApplauseRecorder(options?: {
     cleanupRef.current();
   }, []);
 
-  const start = useCallback(async (requestId: string): Promise<boolean> => {
+  const start = useCallback(async (target: string | ApplauseTargetInput): Promise<boolean> => {
     if (phaseRef.current !== "idle") {
       setErrorCode("busy");
       return false;
@@ -83,6 +89,15 @@ export function useApplauseRecorder(options?: {
 
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       setErrorCode("unsupported");
+      return false;
+    }
+
+    const normalized: ApplauseTargetInput =
+      typeof target === "string" ? { requestId: target } : target;
+    const requestId = normalized.requestId ?? null;
+    const singerName = normalized.singerName?.trim() || undefined;
+    const singerUserId = normalized.singerUserId ?? null;
+    if (!requestId && !singerName) {
       return false;
     }
 
@@ -233,6 +248,8 @@ export function useApplauseRecorder(options?: {
           method: "POST",
           body: JSON.stringify({
             requestId,
+            singerName,
+            singerUserId,
             measurementId,
             durationMs,
             countdownMs: APPLAUSE_COUNTDOWN_MS,

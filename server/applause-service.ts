@@ -9,6 +9,7 @@ import {
   clamp01,
   computeApplauseScore,
   shouldAcceptApplauseUpdate,
+  type ApplauseMeasurementItem,
   type ApplauseStateSnapshot,
   type RoundEvaluationSummary,
 } from "../src/lib/applause-meter.ts";
@@ -17,6 +18,7 @@ import {
   getSingerKey,
   performancePoints,
   sortLeaderboard,
+  summedPerformancePoints,
   type LeaderboardEntry,
 } from "../src/lib/singer.ts";
 
@@ -55,7 +57,7 @@ export async function fetchNightLeaderboard(db: DbClient): Promise<LeaderboardEn
 export async function broadcastNightLeaderboard(
   db: DbClient,
   reason: string,
-  requestId?: string,
+  requestId?: string | null,
 ): Promise<LeaderboardEntry[]> {
   const rows = await fetchNightLeaderboard(db);
   const payload = {
@@ -81,7 +83,7 @@ export async function evaluateRoundAndLeaderboard(
   rows: LeaderboardEntry[];
   topRankings: LeaderboardEntry[];
 }> {
-  const [reqRes, rows] = await Promise.all([
+  const [reqRes, measRes, rows] = await Promise.all([
     db.query<{
       id: string;
       user_id: string | null;
@@ -97,6 +99,12 @@ export async function evaluateRoundAndLeaderboard(
        LIMIT 1`,
       [requestId],
     ),
+    db.query<{ total: string | number; cnt: string | number }>(
+      `SELECT coalesce(sum(score), 0)::int AS total, count(*)::int AS cnt
+       FROM public.applause_measurements
+       WHERE request_id = $1 AND status = 'completed' AND score IS NOT NULL AND included = true`,
+      [requestId],
+    ),
     fetchNightLeaderboard(db),
   ]);
 
@@ -110,10 +118,15 @@ export async function evaluateRoundAndLeaderboard(
     user_id: reqRow.user_id,
     singer_name: reqRow.singer_name,
   });
+  const measCount = Number(measRes.rows[0]?.cnt ?? 0);
   const applauseScore =
-    typeof reqRow.applause_score === "number" ? Math.max(0, Math.min(100, reqRow.applause_score)) : 0;
+    measCount > 0
+      ? Math.max(0, Number(measRes.rows[0]?.total ?? 0))
+      : typeof reqRow.applause_score === "number"
+        ? Math.max(0, Math.min(100, reqRow.applause_score))
+        : 0;
   const likes = Number(reqRow.likes_count ?? 0);
-  const roundPoints = performancePoints(reqRow.applause_score, likes);
+  const roundPoints = summedPerformancePoints(applauseScore, likes);
 
   const deltas = computeRankDeltas(previousRows, rows);
   const delta = deltas[singerId];
@@ -149,11 +162,70 @@ export async function evaluateRoundAndLeaderboard(
   return { evaluation, rows, topRankings };
 }
 
+async function evaluateMeasurementAndLeaderboard(
+  db: DbClient,
+  input: {
+    requestId: string | null;
+    singerUserId: string | null;
+    singerName: string;
+    songTitle: string | null;
+    score: number;
+    likes: number;
+  },
+  previousRows: readonly LeaderboardEntry[],
+  reason = "applause_saved",
+): Promise<{
+  evaluation: RoundEvaluationSummary;
+  rows: LeaderboardEntry[];
+  topRankings: LeaderboardEntry[];
+}> {
+  const rows = await fetchNightLeaderboard(db);
+  const topRankings = rows.slice(0, 5);
+  const singerId = getSingerKey({
+    user_id: input.singerUserId,
+    singer_name: input.singerName,
+  });
+  const roundPoints = performancePoints(input.score, input.likes);
+  const deltas = computeRankDeltas(previousRows, rows);
+  const delta = deltas[singerId];
+  const matchedEntry = rows.find((r) => r.singer_id === singerId);
+
+  const evaluation: RoundEvaluationSummary = {
+    requestId: input.requestId,
+    singerId,
+    singerName: matchedEntry?.display_name ?? input.singerName,
+    songTitle: input.songTitle,
+    isGuest: !input.singerUserId,
+    applauseScore: input.score,
+    likes: input.likes,
+    roundPoints,
+    totalSingerPoints: matchedEntry?.total_points ?? roundPoints,
+    rank: delta?.rank ?? null,
+    previousRank: delta?.previousRank ?? null,
+    rankDelta: delta?.rankDelta ?? 0,
+    evaluatedAt: Date.now(),
+  };
+
+  const eventPayload = {
+    period: "night",
+    reason,
+    requestId: input.requestId,
+    evaluation,
+    rows,
+    topRankings,
+  };
+  broadcastPublicEvent("leaderboard_updated", eventPayload);
+  broadcastStageEvent("leaderboard_updated", eventPayload);
+
+  return { evaluation, rows, topRankings };
+}
+
 function hydrateFromRow(row: {
   id: string;
-  request_id: string;
-  singer_name: string;
-  song_title: string;
+  request_id: string | null;
+  singer_user_id: string | null;
+  singer_name: string | null;
+  song_title: string | null;
   status: string;
   started_at: string | Date;
   countdown_ends_at?: string | Date | null;
@@ -171,9 +243,10 @@ function hydrateFromRow(row: {
   const score = row.score === null || row.score === undefined ? null : Number(row.score);
   return {
     measurementId: row.id,
-    requestId: row.request_id,
-    singerName: row.singer_name,
-    songTitle: row.song_title,
+    requestId: row.request_id ?? null,
+    singerUserId: row.singer_user_id ?? null,
+    singerName: row.singer_name ?? null,
+    songTitle: row.song_title ?? null,
     status: row.status as ApplauseStateSnapshot["status"],
     startedAt: new Date(row.started_at).getTime(),
     countdownEndsAt: row.countdown_ends_at ? new Date(row.countdown_ends_at).getTime() : null,
@@ -192,9 +265,10 @@ function hydrateFromRow(row: {
 export async function getCurrentApplauseState(db: DbClient): Promise<ApplauseStateSnapshot> {
   const res = await db.query<{
     id: string;
-    request_id: string;
-    singer_name: string;
-    song_title: string;
+    request_id: string | null;
+    singer_user_id: string | null;
+    singer_name: string | null;
+    song_title: string | null;
     status: string;
     started_at: string;
     countdown_ends_at: string | null;
@@ -208,10 +282,18 @@ export async function getCurrentApplauseState(db: DbClient): Promise<ApplauseSta
     completed_at: string | null;
     updated_at: string;
   }>(
-    `SELECT m.*, s.singer_name, s.song_title,
-       (SELECT count(*) FROM public.performance_likes l WHERE l.request_id = m.request_id) AS likes_count
+    `SELECT m.*,
+       coalesce(m.singer_user_id, s.user_id) AS singer_user_id,
+       coalesce(nullif(trim(m.singer_name), ''), s.singer_name) AS singer_name,
+       s.song_title,
+       CASE
+         WHEN m.request_id IS NOT NULL THEN (
+           SELECT count(*) FROM public.performance_likes l WHERE l.request_id = m.request_id
+         )
+         ELSE 0
+       END AS likes_count
      FROM public.applause_measurements m
-     JOIN public.song_requests s ON s.id = m.request_id
+     LEFT JOIN public.song_requests s ON s.id = m.request_id
      ORDER BY m.started_at DESC
      LIMIT 1`,
   );
@@ -272,7 +354,14 @@ export async function getCurrentApplauseState(db: DbClient): Promise<ApplauseSta
 
 export async function startApplauseMeasurement(
   db: DbClient,
-  input: { requestId: string; measurementId: string; durationMs?: number; countdownMs?: number },
+  input: {
+    requestId?: string | null;
+    singerName?: string;
+    singerUserId?: string | null;
+    measurementId: string;
+    durationMs?: number;
+    countdownMs?: number;
+  },
 ): Promise<{ ok: true; state: ApplauseStateSnapshot } | { ok: false; status: number; reason: string }> {
   const existing = await getCurrentApplauseState(db);
   const now = Date.now();
@@ -285,27 +374,43 @@ export async function startApplauseMeasurement(
     return { ok: false, status: 409, reason: "busy" };
   }
 
-  const reqRes = await db.query<{
-    id: string;
-    singer_name: string;
-    song_title: string;
-    status: string;
-    likes_count: string;
-  }>(
-    `SELECT s.id, s.singer_name, s.song_title, s.status,
-       (SELECT count(*) FROM public.performance_likes l WHERE l.request_id = s.id) AS likes_count
-     FROM public.song_requests s
-     WHERE s.id = $1
-     LIMIT 1`,
-    [input.requestId],
-  );
+  let resolvedRequestId: string | null = input.requestId ?? null;
+  let resolvedSingerUserId: string | null = input.singerUserId ?? null;
+  let resolvedSingerName = input.singerName?.trim() ?? "";
+  let resolvedSongTitle: string | null = null;
+  let likes = 0;
 
-  const reqRow = reqRes.rows[0];
-  if (!reqRow) {
-    return { ok: false, status: 404, reason: "not_found" };
-  }
-  if (reqRow.status !== "playing" && reqRow.status !== "done") {
-    return { ok: false, status: 400, reason: "bad_status" };
+  if (resolvedRequestId) {
+    const reqRes = await db.query<{
+      id: string;
+      user_id: string | null;
+      singer_name: string;
+      song_title: string;
+      status: string;
+      likes_count: string;
+    }>(
+      `SELECT s.id, s.user_id, s.singer_name, s.song_title, s.status,
+         (SELECT count(*) FROM public.performance_likes l WHERE l.request_id = s.id) AS likes_count
+       FROM public.song_requests s
+       WHERE s.id = $1
+       LIMIT 1`,
+      [resolvedRequestId],
+    );
+
+    const reqRow = reqRes.rows[0];
+    if (!reqRow) {
+      return { ok: false, status: 404, reason: "not_found" };
+    }
+
+    resolvedSingerUserId = reqRow.user_id;
+    resolvedSingerName = reqRow.singer_name;
+    resolvedSongTitle = reqRow.song_title;
+    likes = Number(reqRow.likes_count ?? 0);
+  } else {
+    if (!resolvedSingerName) {
+      return { ok: false, status: 400, reason: "missing_candidate" };
+    }
+    resolvedRequestId = null;
   }
 
   const durationMs = Math.min(30000, Math.max(1000, input.durationMs ?? APPLAUSE_DURATION_MS));
@@ -317,12 +422,14 @@ export async function startApplauseMeasurement(
 
   await db.query(
     `INSERT INTO public.applause_measurements
-       (id, request_id, status, started_at, countdown_ends_at, ends_at, duration_ms, latest_level, latest_peak, last_seq)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 0)
+       (id, request_id, singer_user_id, singer_name, status, started_at, countdown_ends_at, ends_at, duration_ms, latest_level, latest_peak, last_seq, included)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 0, 0, 0, true)
      ON CONFLICT (id) DO NOTHING`,
     [
       input.measurementId,
-      input.requestId,
+      resolvedRequestId,
+      resolvedSingerUserId,
+      resolvedSingerName,
       initialStatus,
       new Date(startedAt).toISOString(),
       countdownEndsAt ? new Date(countdownEndsAt).toISOString() : null,
@@ -333,9 +440,10 @@ export async function startApplauseMeasurement(
 
   currentState = {
     measurementId: input.measurementId,
-    requestId: input.requestId,
-    singerName: reqRow.singer_name,
-    songTitle: reqRow.song_title,
+    requestId: resolvedRequestId,
+    singerUserId: resolvedSingerUserId,
+    singerName: resolvedSingerName,
+    songTitle: resolvedSongTitle,
     status: initialStatus,
     startedAt,
     countdownEndsAt,
@@ -345,7 +453,7 @@ export async function startApplauseMeasurement(
     latestPeak: 0,
     lastSeq: 0,
     score: null,
-    likes: Number(reqRow.likes_count ?? 0),
+    likes,
     totalPoints: null,
     updatedAt: now,
   };
@@ -356,18 +464,26 @@ export async function startApplauseMeasurement(
 
 export async function beginApplauseMeasurement(
   db: DbClient,
-  input: { measurementId: string; requestId: string },
+  input: { measurementId: string; requestId?: string | null },
 ): Promise<{ ok: true; state: ApplauseStateSnapshot } | { ok: false; status: number; reason: string }> {
   if (currentState.measurementId !== input.measurementId) {
     await getCurrentApplauseState(db);
   }
 
-  const mRes = await db.query<{ id: string; request_id: string; status: string; duration_ms: number }>(
+  const mRes = await db.query<{
+    id: string;
+    request_id: string | null;
+    status: string;
+    duration_ms: number;
+  }>(
     `SELECT id, request_id, status, duration_ms FROM public.applause_measurements WHERE id = $1 LIMIT 1`,
     [input.measurementId],
   );
   const mRow = mRes.rows[0];
-  if (!mRow || mRow.request_id !== input.requestId) {
+  if (!mRow) {
+    return { ok: false, status: 404, reason: "measurement_not_found" };
+  }
+  if (input.requestId !== undefined && (mRow.request_id ?? null) !== (input.requestId ?? null)) {
     return { ok: false, status: 404, reason: "measurement_not_found" };
   }
   if (mRow.status === "measuring" && currentState.measurementId === input.measurementId) {
@@ -388,11 +504,14 @@ export async function beginApplauseMeasurement(
     [input.measurementId, new Date(endsAt).toISOString()],
   );
 
-  const likesRes = await db.query<{ likes: string }>(
-    `SELECT count(*)::int AS likes FROM public.performance_likes WHERE request_id = $1`,
-    [input.requestId],
-  );
-  const likes = Number(likesRes.rows[0]?.likes ?? currentState.likes ?? 0);
+  let likes = 0;
+  if (mRow.request_id) {
+    const likesRes = await db.query<{ likes: string }>(
+      `SELECT count(*)::int AS likes FROM public.performance_likes WHERE request_id = $1`,
+      [mRow.request_id],
+    );
+    likes = Number(likesRes.rows[0]?.likes ?? currentState.likes ?? 0);
+  }
 
   currentState = {
     ...currentState,
@@ -411,7 +530,7 @@ export async function pushApplauseLevel(
   db: DbClient,
   input: {
     measurementId: string;
-    requestId: string;
+    requestId?: string | null;
     seq: number;
     level: number;
     peak: number;
@@ -430,7 +549,7 @@ export async function pushApplauseLevel(
   ) {
     await beginApplauseMeasurement(db, {
       measurementId: input.measurementId,
-      requestId: input.requestId,
+      requestId: input.requestId ?? currentState.requestId,
     });
   }
 
@@ -442,7 +561,7 @@ export async function pushApplauseLevel(
   if (
     !shouldAcceptApplauseUpdate(currentState, {
       measurementId: input.measurementId,
-      requestId: input.requestId,
+      requestId: input.requestId !== undefined ? input.requestId : currentState.requestId,
       seq: input.seq,
       updatedAt: now,
     })
@@ -488,7 +607,7 @@ export async function completeApplauseMeasurement(
   db: DbClient,
   input: {
     measurementId: string;
-    requestId: string;
+    requestId?: string | null;
     samples: number[];
   },
 ): Promise<
@@ -499,12 +618,24 @@ export async function completeApplauseMeasurement(
     await getCurrentApplauseState(db);
   }
 
-  const mRes = await db.query<{ id: string; request_id: string; status: string }>(
-    `SELECT id, request_id, status FROM public.applause_measurements WHERE id = $1 LIMIT 1`,
+  const mRes = await db.query<{
+    id: string;
+    request_id: string | null;
+    singer_user_id: string | null;
+    singer_name: string | null;
+    status: string;
+  }>(
+    `SELECT id, request_id, singer_user_id, singer_name, status
+     FROM public.applause_measurements
+     WHERE id = $1
+     LIMIT 1`,
     [input.measurementId],
   );
   const mRow = mRes.rows[0];
-  if (!mRow || mRow.request_id !== input.requestId) {
+  if (!mRow) {
+    return { ok: false, status: 404, reason: "measurement_not_found" };
+  }
+  if (input.requestId !== undefined && (mRow.request_id ?? null) !== (input.requestId ?? null)) {
     return { ok: false, status: 404, reason: "measurement_not_found" };
   }
   if (mRow.status !== "measuring") {
@@ -521,10 +652,13 @@ export async function completeApplauseMeasurement(
 
   const prevRows = await fetchNightLeaderboard(db);
   const breakdown = computeApplauseScore(input.samples);
-  const rpcRes = await db.query<{ dj_record_applause: { ok: boolean; reason?: string; likes?: number; total_points?: number } }>(
-    `SELECT public.dj_record_applause($1, $2, $3) AS dj_record_applause`,
-    [input.requestId, input.measurementId, breakdown.score],
-  );
+  const rpcRes = await db.query<{
+    dj_record_applause: { ok: boolean; reason?: string; likes?: number; total_points?: number };
+  }>(`SELECT public.dj_record_applause($1, $2, $3) AS dj_record_applause`, [
+    mRow.request_id,
+    input.measurementId,
+    breakdown.score,
+  ]);
   const rpc = rpcRes.rows[0]?.dj_record_applause;
   if (!rpc?.ok) {
     return { ok: false, status: 400, reason: rpc?.reason ?? "save_failed" };
@@ -549,23 +683,48 @@ export async function completeApplauseMeasurement(
     ],
   );
 
+  let resolvedSingerUserId = mRow.singer_user_id;
+  let resolvedSingerName = mRow.singer_name ?? currentState.singerName ?? "";
+  let resolvedSongTitle: string | null = currentState.songTitle ?? null;
+
+  if (mRow.request_id) {
+    const reqInfo = await db.query<{
+      user_id: string | null;
+      singer_name: string;
+      song_title: string;
+    }>(`SELECT user_id, singer_name, song_title FROM public.song_requests WHERE id = $1`, [
+      mRow.request_id,
+    ]);
+    if (reqInfo.rows[0]) {
+      resolvedSingerUserId = reqInfo.rows[0].user_id;
+      resolvedSingerName = reqInfo.rows[0].singer_name;
+      resolvedSongTitle = reqInfo.rows[0].song_title;
+    }
+  }
+
   const likes = Number(rpc.likes ?? currentState.likes ?? 0);
   const totalPoints = Number(rpc.total_points ?? performancePoints(breakdown.score, likes));
+  const evalResult = await evaluateMeasurementAndLeaderboard(
+    db,
+    {
+      requestId: mRow.request_id,
+      singerUserId: resolvedSingerUserId,
+      singerName: resolvedSingerName,
+      songTitle: resolvedSongTitle,
+      score: breakdown.score,
+      likes,
+    },
+    prevRows,
+    "applause_saved",
+  );
   const now = Date.now();
-
-  const [reqInfo, evalResult] = await Promise.all([
-    db.query<{ singer_name: string; song_title: string }>(
-      `SELECT singer_name, song_title FROM public.song_requests WHERE id = $1`,
-      [input.requestId],
-    ),
-    evaluateRoundAndLeaderboard(db, input.requestId, prevRows, "applause_saved"),
-  ]);
 
   currentState = {
     measurementId: input.measurementId,
-    requestId: input.requestId,
-    singerName: reqInfo.rows[0]?.singer_name ?? currentState.singerName,
-    songTitle: reqInfo.rows[0]?.song_title ?? currentState.songTitle,
+    requestId: mRow.request_id,
+    singerUserId: resolvedSingerUserId,
+    singerName: resolvedSingerName,
+    songTitle: resolvedSongTitle,
     status: "completed",
     startedAt: currentState.startedAt,
     countdownEndsAt: currentState.countdownEndsAt,
@@ -577,16 +736,19 @@ export async function completeApplauseMeasurement(
     score: breakdown.score,
     likes,
     totalPoints,
-    rank: evalResult.evaluation?.rank ?? null,
-    previousRank: evalResult.evaluation?.previousRank ?? null,
-    rankDelta: evalResult.evaluation?.rankDelta ?? 0,
-    totalSingerPoints: evalResult.evaluation?.totalSingerPoints ?? totalPoints,
+    rank: evalResult.evaluation.rank,
+    previousRank: evalResult.evaluation.previousRank,
+    rankDelta: evalResult.evaluation.rankDelta,
+    totalSingerPoints: evalResult.evaluation.totalSingerPoints,
     topRankings: evalResult.topRankings,
     updatedAt: now,
   };
 
   broadcastStageEvent("applause_state", currentState);
-  broadcastPublicEvent("queue_changed", { reason: "applause_saved", requestId: input.requestId });
+  broadcastPublicEvent("queue_changed", {
+    reason: "applause_saved",
+    requestId: mRow.request_id,
+  });
 
   return { ok: true, state: currentState, breakdown };
 }
@@ -610,14 +772,14 @@ export async function refreshActiveApplauseLikes(
 
 export async function cancelApplauseMeasurement(
   db: DbClient,
-  input: { measurementId: string; requestId: string; reason?: "cancelled" | "failed" },
+  input: { measurementId: string; requestId?: string | null; reason?: "cancelled" | "failed" },
 ): Promise<{ ok: boolean; state: ApplauseStateSnapshot }> {
   const nextStatus = input.reason === "failed" ? "failed" : "cancelled";
   await db.query(
     `UPDATE public.applause_measurements
      SET status = $2, updated_at = now()
-     WHERE id = $1 AND request_id = $3 AND status IN ('countdown', 'measuring')`,
-    [input.measurementId, nextStatus, input.requestId],
+     WHERE id = $1 AND status IN ('countdown', 'measuring')`,
+    [input.measurementId, nextStatus],
   );
 
   const now = Date.now();
@@ -629,4 +791,122 @@ export async function cancelApplauseMeasurement(
 
   broadcastStageEvent("applause_state", currentState);
   return { ok: true, state: currentState };
+}
+
+async function syncRequestApplauseCache(db: DbClient, requestId: string | null): Promise<void> {
+  if (!requestId) return;
+  const latest = await db.query<{ id: string; score: number; completed_at: string | null }>(
+    `SELECT id, score, completed_at
+     FROM public.applause_measurements
+     WHERE request_id = $1 AND status = 'completed' AND score IS NOT NULL AND included = true
+     ORDER BY completed_at DESC NULLS LAST, started_at DESC
+     LIMIT 1`,
+    [requestId],
+  );
+  const row = latest.rows[0];
+  if (row) {
+    await db.query(
+      `UPDATE public.song_requests
+       SET applause_score = $2, applause_measured_at = $3, applause_measurement_id = $4
+       WHERE id = $1`,
+      [requestId, row.score, row.completed_at ?? new Date().toISOString(), row.id],
+    );
+  } else {
+    await db.query(
+      `UPDATE public.song_requests
+       SET applause_score = NULL, applause_measured_at = NULL, applause_measurement_id = NULL
+       WHERE id = $1`,
+      [requestId],
+    );
+  }
+}
+
+export async function listApplauseMeasurements(
+  db: DbClient,
+  limit = 60,
+): Promise<ApplauseMeasurementItem[]> {
+  const res = await db.query<{
+    id: string;
+    request_id: string | null;
+    singer_user_id: string | null;
+    singer_name: string | null;
+    song_title: string | null;
+    score: number;
+    included: boolean;
+    completed_at: string;
+    started_at: string;
+  }>(
+    `SELECT m.id,
+       m.request_id,
+       coalesce(m.singer_user_id, s.user_id) AS singer_user_id,
+       coalesce(nullif(trim(m.singer_name), ''), s.singer_name, '') AS singer_name,
+       s.song_title,
+       m.score,
+       m.included,
+       coalesce(m.completed_at, m.updated_at, m.started_at) AS completed_at,
+       m.started_at
+     FROM public.applause_measurements m
+     LEFT JOIN public.song_requests s ON s.id = m.request_id
+     WHERE m.status = 'completed' AND m.score IS NOT NULL
+     ORDER BY coalesce(m.completed_at, m.started_at) DESC
+     LIMIT $1`,
+    [limit],
+  );
+
+  return res.rows.map((r) => ({
+    id: r.id,
+    request_id: r.request_id ?? null,
+    singer_user_id: r.singer_user_id ?? null,
+    singer_name: r.singer_name ?? "",
+    song_title: r.song_title ?? null,
+    score: Number(r.score),
+    included: Boolean(r.included),
+    completed_at: new Date(r.completed_at).toISOString(),
+    started_at: new Date(r.started_at).toISOString(),
+  }));
+}
+
+export async function setApplauseMeasurementIncluded(
+  db: DbClient,
+  id: string,
+  included: boolean,
+): Promise<{ ok: boolean; row?: ApplauseMeasurementItem }> {
+  const upd = await db.query<{ id: string; request_id: string | null }>(
+    `UPDATE public.applause_measurements
+     SET included = $2, updated_at = now()
+     WHERE id = $1 AND status = 'completed' AND score IS NOT NULL
+     RETURNING id, request_id`,
+    [id, included],
+  );
+  const updated = upd.rows[0];
+  if (!updated) {
+    return { ok: false };
+  }
+
+  await syncRequestApplauseCache(db, updated.request_id);
+  await broadcastNightLeaderboard(db, "measurement_toggled", updated.request_id);
+  broadcastPublicEvent("queue_changed", { reason: "measurement_toggled", requestId: updated.request_id });
+
+  const all = await listApplauseMeasurements(db, 60);
+  const row = all.find((item) => item.id === id);
+  return { ok: true, row };
+}
+
+export async function deleteApplauseMeasurement(
+  db: DbClient,
+  id: string,
+): Promise<{ ok: boolean }> {
+  const del = await db.query<{ id: string; request_id: string | null }>(
+    `DELETE FROM public.applause_measurements WHERE id = $1 RETURNING id, request_id`,
+    [id],
+  );
+  const removed = del.rows[0];
+  if (!removed) {
+    return { ok: false };
+  }
+
+  await syncRequestApplauseCache(db, removed.request_id);
+  await broadcastNightLeaderboard(db, "measurement_deleted", removed.request_id);
+  broadcastPublicEvent("queue_changed", { reason: "measurement_deleted", requestId: removed.request_id });
+  return { ok: true };
 }

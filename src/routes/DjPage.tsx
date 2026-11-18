@@ -43,6 +43,8 @@ import {
   Heart,
   Settings,
   ExternalLink,
+  CheckCircle2,
+  Ban,
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { toast } from "sonner";
@@ -55,14 +57,18 @@ import { DjSongSearch } from "@/components/DjSongSearch";
 import { SettingsDialog } from "@/components/SettingsDialog";
 import { useQueue } from "@/hooks/use-queue";
 import { useStageControl } from "@/hooks/use-stage-control";
-import { useApplauseRecorder, type RecorderErrorCode } from "@/hooks/use-applause-recorder";
+import {
+  useApplauseRecorder,
+  type ApplauseTargetInput,
+  type RecorderErrorCode,
+} from "@/hooks/use-applause-recorder";
 import { ApiError, apiJson, setDjToken } from "@/lib/api";
 import { setApplauseAudioSuppressed } from "@/lib/applause";
-import { computeSpectrumColumns } from "@/lib/applause-meter";
+import { computeSpectrumColumns, type ApplauseMeasurementItem } from "@/lib/applause-meter";
 import { LOGO_URL } from "@/lib/assets";
 import { DJ_ACTIVE_STORAGE_KEY, useI18n, type Lang } from "@/lib/i18n";
 import { playOrder, type SongRequest } from "@/lib/queue";
-import { performancePoints } from "@/lib/singer";
+import { summedPerformancePoints, type LeaderboardEntry } from "@/lib/singer";
 
 export function DjPage() {
   const [authed, setAuthed] = useState<boolean | null>(null);
@@ -193,7 +199,29 @@ function Desk({ onLogout }: { onLogout: () => void }) {
   const stageCtrl = useStageControl(true);
   const [stage, setStage] = useState<SongRequest | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
+  const [measurements, setMeasurements] = useState<ApplauseMeasurementItem[]>([]);
+  const [leaderboardSingers, setLeaderboardSingers] = useState<LeaderboardEntry[]>([]);
+  const [selectedTargetKey, setSelectedTargetKey] = useState<string>("auto");
+  const [freeCandidateName, setFreeCandidateName] = useState("");
+  const [measurementBusyId, setMeasurementBusyId] = useState<string | null>(null);
   const completedLocalIdsRef = useRef<Set<string>>(new Set());
+
+  const loadApplauseExtras = useCallback(async () => {
+    try {
+      const [mRes, lbRes] = await Promise.all([
+        apiJson<{ rows: ApplauseMeasurementItem[] }>("/api/applause/measurements"),
+        apiJson<{ rows: LeaderboardEntry[] }>("/api/leaderboard?period=night"),
+      ]);
+      setMeasurements(mRes.rows ?? []);
+      setLeaderboardSingers(lbRes.rows ?? []);
+    } catch {
+      /* ignore transient fetch errors */
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadApplauseExtras();
+  }, [loadApplauseExtras, rows.length]);
 
   useEffect(() => {
     const saved = localStorage.getItem("pm-external-stage");
@@ -214,7 +242,7 @@ function Desk({ onLogout }: { onLogout: () => void }) {
   const recorder = useApplauseRecorder({
     onCompleted: async (res) => {
       toast.success(`${t.applauseSavedToast}: ${res.score}/100`);
-      await reload();
+      await Promise.all([reload(), loadApplauseExtras()]);
     },
     onUnauthorized: () => {
       toast.error(t.djExpired);
@@ -245,7 +273,163 @@ function Desk({ onLogout }: { onLogout: () => void }) {
 
   const playingSong = order.find((r) => r.status === "playing");
   const recentCompletedSong = done.find((r) => r.status === "done");
-  const applauseTarget = playingSong ?? recentCompletedSong ?? null;
+  const autoTargetSong = playingSong ?? recentCompletedSong ?? order[0] ?? null;
+
+  const selectableSongs = useMemo(() => {
+    const seen = new Set<string>();
+    const list: SongRequest[] = [];
+    for (const r of [...order, ...done]) {
+      if (!seen.has(r.id)) {
+        seen.add(r.id);
+        list.push(r);
+      }
+    }
+    return list;
+  }, [order, done]);
+
+  const standaloneCandidates = useMemo(() => {
+    const map = new Map<string, { key: string; name: string; userId: string | null }>();
+    for (const s of leaderboardSingers) {
+      const uid = s.is_guest ? null : s.singer_id;
+      const normKey = uid ? `u:${uid}` : `g:${s.display_name.trim().toLowerCase()}`;
+      if (!map.has(normKey)) {
+        map.set(normKey, {
+          key: `singer:${uid ?? ""}:${s.display_name}`,
+          name: s.display_name,
+          userId: uid,
+        });
+      }
+    }
+    for (const m of measurements) {
+      const uid = m.singer_user_id ?? null;
+      const normKey = uid ? `u:${uid}` : `g:${m.singer_name.trim().toLowerCase()}`;
+      if (m.singer_name.trim() && !map.has(normKey)) {
+        map.set(normKey, {
+          key: `singer:${uid ?? ""}:${m.singer_name}`,
+          name: m.singer_name,
+          userId: uid,
+        });
+      }
+    }
+    return Array.from(map.values());
+  }, [leaderboardSingers, measurements]);
+
+  const resolvedApplauseTarget = useMemo((): {
+    song: SongRequest | null;
+    singerName: string;
+    singerUserId: string | null;
+    input: ApplauseTargetInput;
+  } | null => {
+    if (selectedTargetKey.startsWith("req:")) {
+      const reqId = selectedTargetKey.slice(4);
+      const found = rows.find((r) => r.id === reqId);
+      if (found) {
+        return {
+          song: found,
+          singerName: found.singer_name,
+          singerUserId: found.user_id,
+          input: {
+            requestId: found.id,
+            singerName: found.singer_name,
+            singerUserId: found.user_id,
+          },
+        };
+      }
+    }
+    if (selectedTargetKey.startsWith("singer:")) {
+      const rest = selectedTargetKey.slice(7);
+      const sep = rest.indexOf(":");
+      const uid = sep >= 0 ? rest.slice(0, sep) || null : null;
+      const name = sep >= 0 ? rest.slice(sep + 1) : rest;
+      if (name.trim()) {
+        return {
+          song: null,
+          singerName: name.trim(),
+          singerUserId: uid,
+          input: {
+            requestId: null,
+            singerName: name.trim(),
+            singerUserId: uid,
+          },
+        };
+      }
+    }
+    if (autoTargetSong) {
+      return {
+        song: autoTargetSong,
+        singerName: autoTargetSong.singer_name,
+        singerUserId: autoTargetSong.user_id,
+        input: {
+          requestId: autoTargetSong.id,
+          singerName: autoTargetSong.singer_name,
+          singerUserId: autoTargetSong.user_id,
+        },
+      };
+    }
+    return null;
+  }, [selectedTargetKey, rows, autoTargetSong]);
+
+  const toggleMeasurementIncluded = useCallback(
+    async (item: ApplauseMeasurementItem) => {
+      setMeasurementBusyId(item.id);
+      try {
+        const res = await apiJson<{ ok: boolean; row?: ApplauseMeasurementItem }>(
+          `/api/applause/measurements/${item.id}`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({ included: !item.included }),
+          },
+        );
+        if (res.ok) {
+          await Promise.all([reload(), loadApplauseExtras()]);
+        }
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          toast.error(t.djExpired);
+          onLogout();
+        } else {
+          toast.error(t.errGeneric);
+        }
+      } finally {
+        setMeasurementBusyId(null);
+      }
+    },
+    [reload, loadApplauseExtras, onLogout, t.djExpired, t.errGeneric],
+  );
+
+  const deleteMeasurement = useCallback(
+    async (id: string) => {
+      setMeasurementBusyId(id);
+      try {
+        await apiJson<{ ok: boolean }>(`/api/applause/measurements/${id}`, {
+          method: "DELETE",
+        });
+        await Promise.all([reload(), loadApplauseExtras()]);
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          toast.error(t.djExpired);
+          onLogout();
+        } else {
+          toast.error(t.errGeneric);
+        }
+      } finally {
+        setMeasurementBusyId(null);
+      }
+    },
+    [reload, loadApplauseExtras, onLogout, t.djExpired, t.errGeneric],
+  );
+
+  const startFreeCandidateMeasurement = useCallback(() => {
+    const clean = freeCandidateName.trim();
+    if (!clean || isMeasuringFallback(recorder.phase, stageCtrl.applause.status)) return;
+    const matched = leaderboardSingers.find(
+      (s) => s.display_name.trim().toLowerCase() === clean.toLowerCase(),
+    );
+    const uid = matched && !matched.is_guest ? matched.singer_id : null;
+    setSelectedTargetKey(`singer:${uid ?? ""}:${clean}`);
+    setFreeCandidateName("");
+    void recorder.start({ requestId: null, singerName: clean, singerUserId: uid });
+  }, [freeCandidateName, leaderboardSingers, recorder, stageCtrl.applause.status]);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -521,11 +705,15 @@ function Desk({ onLogout }: { onLogout: () => void }) {
               <Mic className="size-5" />
               {t.applauseStageTitle}
             </div>
-            {applauseTarget ? (
+            {resolvedApplauseTarget ? (
               <div className="mt-0.5 text-sm text-muted-foreground">
                 <span>{t.applauseTargetSong}: </span>
-                <strong className="text-foreground">{applauseTarget.singer_name}</strong> —{" "}
-                <span className="truncate">{applauseTarget.song_title}</span>
+                <strong className="text-foreground">{resolvedApplauseTarget.singerName}</strong> —{" "}
+                <span className="truncate">
+                  {resolvedApplauseTarget.song
+                    ? resolvedApplauseTarget.song.song_title
+                    : t.applauseStandaloneBadge}
+                </span>
               </div>
             ) : (
               <div className="mt-0.5 text-sm text-muted-foreground">{t.applauseErrNoTarget}</div>
@@ -536,11 +724,15 @@ function Desk({ onLogout }: { onLogout: () => void }) {
             {recorder.phase === "idle" ? (
               <Button
                 data-testid="dj-applause-start"
-                disabled={!applauseTarget || isMeasuring}
-                onClick={() => applauseTarget && void recorder.start(applauseTarget.id)}
+                disabled={!resolvedApplauseTarget || isMeasuring}
+                onClick={() =>
+                  resolvedApplauseTarget && void recorder.start(resolvedApplauseTarget.input)
+                }
               >
                 <Mic className="size-4" />
-                {typeof applauseTarget?.applause_score === "number"
+                {resolvedApplauseTarget?.song &&
+                ((resolvedApplauseTarget.song.applause_count ?? 0) > 0 ||
+                  typeof resolvedApplauseTarget.song.applause_score === "number")
                   ? t.applauseRemeasureBtn
                   : t.applauseMeasureBtn}
               </Button>
@@ -558,6 +750,61 @@ function Desk({ onLogout }: { onLogout: () => void }) {
               </Button>
             )}
           </div>
+        </div>
+
+        {/* Target selector (any queued/past song or any candidate with or without song) */}
+        <div className="mt-3 grid gap-2 sm:grid-cols-2">
+          <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+            <span>{t.applauseTargetLabel}</span>
+            <select
+              data-testid="dj-applause-target-select"
+              value={selectedTargetKey}
+              disabled={isMeasuring}
+              onChange={(e) => setSelectedTargetKey(e.target.value)}
+              className="h-9 rounded-md border border-input bg-background px-2.5 text-sm text-foreground"
+            >
+              <option value="auto">{t.applauseTargetAuto}</option>
+              {selectableSongs.map((s) => (
+                <option key={s.id} value={`req:${s.id}`}>
+                  {s.singer_name} — {s.song_title} ({s.status})
+                </option>
+              ))}
+              {standaloneCandidates.map((c) => (
+                <option key={c.key} value={c.key}>
+                  {c.name} ({t.applauseStandaloneBadge})
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <form
+            className="flex items-end gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              startFreeCandidateMeasurement();
+            }}
+          >
+            <Input
+              data-testid="dj-applause-free-candidate"
+              value={freeCandidateName}
+              disabled={isMeasuring}
+              onChange={(e) => setFreeCandidateName(e.target.value)}
+              placeholder={t.applauseFreeCandidatePh}
+              maxLength={60}
+              className="h-9 flex-1 text-sm"
+            />
+            <Button
+              type="submit"
+              variant="secondary"
+              size="sm"
+              data-testid="dj-applause-free-start"
+              disabled={!freeCandidateName.trim() || isMeasuring}
+              className="h-9 shrink-0"
+            >
+              <Mic className="size-3.5" />
+              {t.applauseMeasureFreeBtn}
+            </Button>
+          </form>
         </div>
 
         {recorder.phase === "preparing" && (
@@ -706,27 +953,118 @@ function Desk({ onLogout }: { onLogout: () => void }) {
           </div>
         )}
 
-        {applauseTarget && (
-          <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1 tabular-nums">
-              <Award className="size-3.5 text-accent" />
-              {t.applauseScoreLabel}:{" "}
-              <strong className="text-foreground">
-                {typeof applauseTarget.applause_score === "number"
-                  ? `${applauseTarget.applause_score}/100`
-                  : t.applauseNotMeasured}
-              </strong>
-            </span>
-            <span className="flex items-center gap-1 tabular-nums">
-              <Heart className="size-3.5 text-primary" />
-              {t.likes}: <strong className="text-foreground">{applauseTarget.likes_count ?? 0}</strong>
-            </span>
-            <span className="tabular-nums">
-              {t.applauseTotalPoints}:{" "}
-              <strong className="text-primary">
-                {performancePoints(applauseTarget.applause_score, applauseTarget.likes_count ?? 0)}
-              </strong>
-            </span>
+        {resolvedApplauseTarget?.song && (() => {
+          const s = resolvedApplauseTarget.song;
+          const applauseVal = s.applause_total ?? s.applause_score;
+          const count = s.applause_count ?? (typeof s.applause_score === "number" ? 1 : 0);
+          const likes = s.likes_count ?? 0;
+          return (
+            <div className="mt-3 flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
+              <span className="flex items-center gap-1 tabular-nums">
+                <Award className="size-3.5 text-accent" />
+                {t.applauseScoreLabel}:{" "}
+                <strong className="text-foreground">
+                  {typeof applauseVal === "number"
+                    ? count > 1
+                      ? `${applauseVal} (${count}×)`
+                      : `${applauseVal}/100`
+                    : t.applauseNotMeasured}
+                </strong>
+              </span>
+              <span className="flex items-center gap-1 tabular-nums">
+                <Heart className="size-3.5 text-primary" />
+                {t.likes}: <strong className="text-foreground">{likes}</strong>
+              </span>
+              <span className="tabular-nums">
+                {t.applauseTotalPoints}:{" "}
+                <strong className="text-primary">
+                  {summedPerformancePoints(applauseVal, likes)}
+                </strong>
+              </span>
+            </div>
+          );
+        })()}
+
+        {measurements.length > 0 && (
+          <div className="mt-4 border-t border-border/60 pt-3">
+            <div className="mb-2 flex items-center justify-between text-xs font-semibold text-muted-foreground">
+              <span>
+                {t.applauseMeasurementsHistory} ({measurements.length})
+              </span>
+            </div>
+            <ul
+              data-testid="dj-applause-history"
+              className="max-h-56 space-y-1.5 overflow-y-auto pr-1 text-xs"
+            >
+              {measurements.map((m) => {
+                const busy = measurementBusyId === m.id;
+                return (
+                  <li
+                    key={m.id}
+                    className={`flex flex-wrap items-center gap-2 rounded-lg border px-2.5 py-1.5 ${
+                      m.included
+                        ? "border-border bg-background/60"
+                        : "border-border/40 bg-background/25 opacity-65"
+                    }`}
+                  >
+                    <span className="font-semibold text-foreground">{m.singer_name}</span>
+                    <span className="max-w-44 truncate text-muted-foreground">
+                      {m.song_title ?? t.applauseStandaloneBadge}
+                    </span>
+                    <span
+                      className={`font-bold tabular-nums ${
+                        m.included ? "text-primary" : "line-through text-muted-foreground"
+                      }`}
+                    >
+                      {m.score}/100
+                    </span>
+                    <div className="ml-auto flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        data-testid={`dj-measurement-toggle-${m.id}`}
+                        onClick={() => void toggleMeasurementIncluded(m)}
+                        className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-semibold transition-colors ${
+                          m.included
+                            ? "border-success/50 bg-success/10 text-success"
+                            : "border-border bg-muted/40 text-muted-foreground"
+                        }`}
+                      >
+                        {m.included ? (
+                          <CheckCircle2 className="size-3" />
+                        ) : (
+                          <Ban className="size-3" />
+                        )}
+                        {m.included ? t.applauseIncludedBadge : t.applauseExcludedBadge}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isMeasuring}
+                        onClick={() =>
+                          void recorder.start({
+                            requestId: m.request_id,
+                            singerName: m.singer_name,
+                            singerUserId: m.singer_user_id,
+                          })
+                        }
+                        className="rounded-md border border-border px-2 py-0.5 text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-50"
+                      >
+                        {t.applauseMeasureAgainShort}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        aria-label={t.djDelete}
+                        onClick={() => void deleteMeasurement(m.id)}
+                        className="rounded p-1 text-destructive/80 hover:bg-destructive/10 hover:text-destructive"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
           </div>
         )}
       </section>
@@ -753,9 +1091,19 @@ function Desk({ onLogout }: { onLogout: () => void }) {
                     onSelect={() => setSelected(r.id)}
                     act={act}
                     move={move}
+                    isMeasuring={isMeasuring}
+                    onMeasure={() => {
+                      setSelectedTargetKey(`req:${r.id}`);
+                      void recorder.start({
+                        requestId: r.id,
+                        singerName: r.singer_name,
+                        singerUserId: r.user_id,
+                      });
+                    }}
                     onDelete={async () => {
                       await apiJson(`/api/dj/requests/${r.id}`, { method: "DELETE" });
                       setRows((p) => p.filter((x) => x.id !== r.id));
+                      void loadApplauseExtras();
                     }}
                   />
                 ))}
@@ -772,9 +1120,11 @@ function Desk({ onLogout }: { onLogout: () => void }) {
               <h2 className="mb-2 text-lg text-muted-foreground">{t.djLast}</h2>
               <ul className="space-y-1 text-sm text-muted-foreground">
                 {done.map((r) => {
-                  const hasScore = typeof r.applause_score === "number";
+                  const applauseVal = r.applause_total ?? r.applause_score;
+                  const count = r.applause_count ?? (typeof r.applause_score === "number" ? 1 : 0);
+                  const hasScore = typeof applauseVal === "number";
                   const likes = r.likes_count ?? 0;
-                  const pts = performancePoints(r.applause_score, likes);
+                  const pts = summedPerformancePoints(applauseVal, likes);
                   return (
                     <li key={r.id} className="flex flex-wrap items-center gap-2 border-b border-border/40 py-1.5">
                       <span className={r.status === "done" ? "text-success" : "text-destructive"}>
@@ -783,9 +1133,28 @@ function Desk({ onLogout }: { onLogout: () => void }) {
                       <span className="font-semibold text-foreground">{r.singer_name}</span>
                       <span className="truncate">{r.song_title}</span>
                       <span className="ml-auto text-xs tabular-nums">
-                        {hasScore ? `${r.applause_score}/100` : t.applauseNotMeasured} · ♥ {likes} ·{" "}
-                        <strong className="text-primary">{pts} {t.points}</strong>
+                        {hasScore
+                          ? count > 1
+                            ? `${applauseVal} (${count}×)`
+                            : `${applauseVal}/100`
+                          : t.applauseNotMeasured}{" "}
+                        · ♥ {likes} · <strong className="text-primary">{pts} {t.points}</strong>
                       </span>
+                      <button
+                        type="button"
+                        disabled={isMeasuring}
+                        className="text-xs text-primary underline disabled:opacity-50"
+                        onClick={() => {
+                          setSelectedTargetKey(`req:${r.id}`);
+                          void recorder.start({
+                            requestId: r.id,
+                            singerName: r.singer_name,
+                            singerUserId: r.user_id,
+                          });
+                        }}
+                      >
+                        {t.applauseMeasureAgainShort}
+                      </button>
                       <button
                         type="button"
                         className="text-xs underline"
@@ -832,6 +1201,10 @@ function Desk({ onLogout }: { onLogout: () => void }) {
   );
 }
 
+function isMeasuringFallback(phase: string, stageStatus: string): boolean {
+  return phase !== "idle" || stageStatus === "countdown" || stageStatus === "measuring";
+}
+
 function Row({
   r,
   index,
@@ -839,6 +1212,8 @@ function Row({
   onSelect,
   act,
   move,
+  isMeasuring,
+  onMeasure,
   onDelete,
 }: {
   r: SongRequest;
@@ -847,6 +1222,8 @@ function Row({
   onSelect: () => void;
   act: (id: string, s: "next" | "playing" | "done" | "skipped") => void;
   move: (id: string, dir: -1 | 1) => void;
+  isMeasuring: boolean;
+  onMeasure: () => void;
   onDelete: () => void;
 }) {
   const { t } = useI18n();
@@ -856,7 +1233,9 @@ function Row({
   const style = { transform: CSS.Transform.toString(transform), transition };
   const playing = r.status === "playing";
   const next = r.status === "next";
-  const hasScore = typeof r.applause_score === "number";
+  const applauseVal = r.applause_total ?? r.applause_score;
+  const count = r.applause_count ?? (typeof r.applause_score === "number" ? 1 : 0);
+  const hasScore = typeof applauseVal === "number";
   const likes = r.likes_count ?? 0;
 
   return (
@@ -904,12 +1283,19 @@ function Row({
         </div>
         {(likes > 0 || hasScore) && (
           <div className="text-xs text-muted-foreground tabular-nums">
-            {hasScore ? `${t.applausePointsShort}: ${r.applause_score}/100` : t.applauseNotMeasured} · ♥{" "}
-            {likes} · {performancePoints(r.applause_score, likes)} {t.points}
+            {hasScore
+              ? count > 1
+                ? `${t.applausePointsShort}: ${applauseVal} (${count}×)`
+                : `${t.applausePointsShort}: ${applauseVal}/100`
+              : t.applauseNotMeasured}{" "}
+            · ♥ {likes} · {summedPerformancePoints(applauseVal, likes)} {t.points}
           </div>
         )}
       </div>
       <div className="flex shrink-0 items-center gap-1">
+        <IconBtn label={t.applauseMeasureBtn} disabled={isMeasuring} onClick={onMeasure}>
+          <Mic className="size-4 text-primary" />
+        </IconBtn>
         <IconBtn label={t.djUp} onClick={() => move(r.id, -1)}>
           <ChevronUp className="size-4" />
         </IconBtn>
@@ -941,11 +1327,13 @@ function IconBtn({
   label,
   onClick,
   hot,
+  disabled,
 }: {
   children: React.ReactNode;
   label: string;
   onClick: () => void;
   hot?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <Button
@@ -954,6 +1342,7 @@ function IconBtn({
       variant={hot ? "default" : "ghost"}
       aria-label={label}
       title={label}
+      disabled={disabled}
       onClick={(e) => {
         e.stopPropagation();
         onClick();
